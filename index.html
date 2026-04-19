@@ -1166,6 +1166,31 @@
         const DEFAULT_API_EXEC_URL = 'https://script.google.com/macros/s/AKfycbzwMYCFZvwpRCxSZhQA-FI_dankJb7kC_wYFbN6O4emrjES7vS1JDgQ7Q1YEriwK-k/exec';
         const API_EXEC_URL = resolveApiExecUrl_();
         const PRINTER_STORAGE_KEY = 'mytix_last_printer';
+        const FORCED_PRINTER_LANGUAGE = resolveQueryParam_('lang');
+        const FORCED_CODEPAGE_MAPPING = resolveQueryParam_('cp');
+        const SUPPORTED_CODEPAGE_MAPPINGS = {
+            'bixolon': true,
+            'bixolon-legacy': true,
+            'citizen': true,
+            'epson': true,
+            'epson-legacy': true,
+            'fujitsu': true,
+            'hp': true,
+            'metapace': true,
+            'mpt': true,
+            'pos-5890': true,
+            'pos-8360': true,
+            'star': true,
+            'xprinter': true,
+            'youku': true
+        };
+        const CODEPAGE_MAPPING_ALIASES = {
+            'bixolonlegacy': 'bixolon-legacy',
+            'epsonlegacy': 'epson-legacy',
+            'pos5890': 'pos-5890',
+            'pos8360': 'pos-8360',
+            'zjiang': 'pos-5890'
+        };
 
         let products = [];
         let cart = [];
@@ -1333,9 +1358,11 @@
                 return;
             }
 
+            const normalizedLanguage = normalizePrinterLanguage_(device.language || 'esc-pos');
+            const normalizedCodepageMapping = normalizeCodepageMapping_(device.codepageMapping);
             printerSettings = {
-                language: device.language || 'esc-pos',
-                codepageMapping: device.codepageMapping || undefined
+                language: normalizedLanguage,
+                codepageMapping: normalizedCodepageMapping || undefined
             };
             connectedPrinterName = String(device.name || 'Printer Bluetooth');
             isPrinterConnected = true;
@@ -1566,12 +1593,14 @@
                 return;
             }
 
+            const normalizedLanguage = normalizePrinterLanguage_(device.language || 'esc-pos');
+            const normalizedCodepageMapping = normalizeCodepageMapping_(device.codepageMapping);
             const storableDevice = {
                 id: String(device.id),
                 name: String(device.name || ''),
                 type: String(device.type || 'bluetooth'),
-                language: String(device.language || 'esc-pos'),
-                codepageMapping: device.codepageMapping || undefined
+                language: normalizedLanguage,
+                codepageMapping: normalizedCodepageMapping || undefined
             };
 
             try {
@@ -1590,6 +1619,10 @@
 
             if (/messageSize/i.test(rawMessage)) {
                 return 'Printer belum siap dipakai. Hubungkan ulang lewat tombol "Hubungkan Printer Bluetooth", lalu coba cetak lagi.';
+            }
+
+            if (/unknown codepage mapping/i.test(rawMessage)) {
+                return 'Codepage printer tidak dikenali. Sistem sudah mencoba fallback otomatis, coba hubungkan ulang printer lalu cetak lagi.';
             }
 
             if (error.name === 'NotFoundError') {
@@ -1616,15 +1649,16 @@
         }
 
         function buildBluetoothReceiptData_(transaction) {
-            const encoderOptions = {};
-            if (printerSettings && printerSettings.language) {
-                encoderOptions.language = printerSettings.language;
+            let encoder = null;
+            try {
+                encoder = createReceiptEncoder_();
+            } catch (error) {
+                console.warn('Encoder setup fallback dipakai:', error);
+                encoder = new ReceiptPrinterEncoder({
+                    language: 'esc-pos',
+                    codepageMapping: 'epson'
+                });
             }
-            if (printerSettings && printerSettings.codepageMapping) {
-                encoderOptions.codepageMapping = printerSettings.codepageMapping;
-            }
-
-            let encoder = new ReceiptPrinterEncoder(encoderOptions);
             const width = 32;
             const safeItems = Array.isArray(transaction.items) ? transaction.items : [];
 
@@ -1667,6 +1701,102 @@
             return encoder.encode();
         }
 
+        function normalizePrinterLanguage_(languageValue) {
+            const normalized = String(languageValue || '').trim().toLowerCase();
+            if (!normalized) {
+                return 'esc-pos';
+            }
+
+            if (normalized === 'star-prnt') {
+                return 'star-prnt';
+            }
+
+            if (normalized === 'star-line') {
+                return 'star-line';
+            }
+
+            return 'esc-pos';
+        }
+
+        function normalizeCodepageMapping_(mappingValue) {
+            if (mappingValue && typeof mappingValue === 'object' && !Array.isArray(mappingValue)) {
+                const customMapping = sanitizeCustomCodepageMapping_(mappingValue);
+                return customMapping || '';
+            }
+
+            const normalized = String(mappingValue || '').trim().toLowerCase();
+            if (!normalized || normalized === 'default' || normalized === 'auto' || normalized === 'unknown' || normalized === 'none') {
+                return '';
+            }
+
+            const mappedAlias = CODEPAGE_MAPPING_ALIASES[normalized] || normalized;
+            if (!SUPPORTED_CODEPAGE_MAPPINGS[mappedAlias]) {
+                return '';
+            }
+
+            return mappedAlias;
+        }
+
+        function sanitizeCustomCodepageMapping_(mappingObject) {
+            const safeMapping = {};
+            const keys = Object.keys(mappingObject || {});
+            keys.forEach((key) => {
+                const normalizedKey = String(key || '').trim().toLowerCase();
+                const rawValue = mappingObject[key];
+                const numericValue = Number(rawValue);
+                if (/^cp\d+$/i.test(normalizedKey) && Number.isFinite(numericValue) && numericValue >= 0) {
+                    safeMapping[normalizedKey] = numericValue;
+                }
+            });
+
+            return Object.keys(safeMapping).length ? safeMapping : null;
+        }
+
+        function createReceiptEncoder_() {
+            const connectedLanguage = normalizePrinterLanguage_(printerSettings && printerSettings.language);
+            const forcedLanguage = normalizePrinterLanguage_(FORCED_PRINTER_LANGUAGE);
+            const language = FORCED_PRINTER_LANGUAGE ? forcedLanguage : connectedLanguage;
+            const forcedMapping = normalizeCodepageMapping_(FORCED_CODEPAGE_MAPPING);
+            const preferredMapping = forcedMapping || normalizeCodepageMapping_(printerSettings && printerSettings.codepageMapping);
+            const attempts = [];
+
+            if (preferredMapping) {
+                attempts.push({ language, codepageMapping: preferredMapping });
+            }
+
+            if (language === 'esc-pos') {
+                attempts.push({ language, codepageMapping: 'epson' });
+                attempts.push({ language, codepageMapping: 'xprinter' });
+                attempts.push({ language, codepageMapping: 'pos-5890' });
+                attempts.push({ language, codepageMapping: 'mpt' });
+                attempts.push({ language, codepageMapping: 'star' });
+            }
+
+            attempts.push({ language });
+            attempts.push({});
+
+            const seen = {};
+            for (const option of attempts) {
+                const key = JSON.stringify(option);
+                if (seen[key]) {
+                    continue;
+                }
+                seen[key] = true;
+
+                try {
+                    return new ReceiptPrinterEncoder(option);
+                } catch (error) {
+                    const message = String(error && error.message ? error.message : '');
+                    if (/unknown codepage mapping/i.test(message)) {
+                        continue;
+                    }
+                    throw error;
+                }
+            }
+
+            return new ReceiptPrinterEncoder();
+        }
+
         function sanitizePrintText_(value, maxLength) {
             const cleanText = String(value || '')
                 .replace(/[\u0000-\u001f\u007f]/g, '')
@@ -1695,7 +1825,7 @@
 
         function resolveApiExecUrl_() {
             try {
-                const queryApi = new URLSearchParams(window.location.search).get('api');
+                const queryApi = resolveQueryParam_('api');
                 if (queryApi) {
                     return normalizeApiUrl_(queryApi);
                 }
@@ -1709,6 +1839,14 @@
             }
 
             return normalizeApiUrl_(DEFAULT_API_EXEC_URL);
+        }
+
+        function resolveQueryParam_(paramName) {
+            try {
+                return new URLSearchParams(window.location.search).get(paramName);
+            } catch (error) {
+                return '';
+            }
         }
 
         function normalizeApiUrl_(urlValue) {
